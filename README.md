@@ -1,4 +1,4 @@
-# ds-vk
+# dans-vk
 
 Personal Vulkan helper/runtime for C++ visualization experiments.
 
