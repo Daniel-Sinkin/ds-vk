@@ -1,6 +1,8 @@
 #include "dans/vk/runtime.hpp"
 
+#include "dans/vk/font_atlas.hpp"
 #include "dans/vk/math.hpp"
+#include "dans/vk/shape_draw.hpp"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -226,6 +228,25 @@ struct EnvironmentPushConstants
     Vec4 background_top_color{};
 };
 
+struct TextInstance
+{
+    Vec2 position{};
+    Vec2 size{};
+    Vec2 uv_position{};
+    Vec2 uv_size{};
+    Vec4 color{};
+};
+
+struct TextPushConstants
+{
+    Mat4 view_projection{1.0f};
+};
+
+struct ShapePushConstants
+{
+    Mat4 view_projection{1.0f};
+};
+
 // clang-format off
 static_assert(sizeof(MeshPushConstants)                    == 128zu);
 static_assert(sizeof(GpuMeshInstance)                      == 144zu);
@@ -245,10 +266,18 @@ static_assert(sizeof(GpuLight)                             == 64zu);
 static_assert(sizeof(GpuLighting)                          == 112zu + k_max_lights * sizeof(GpuLight));
 static_assert(sizeof(DebugPushConstants)                   == 96zu);
 static_assert(sizeof(EnvironmentPushConstants)             == 128zu);
+static_assert(sizeof(TextInstance)                         == 48zu);
+static_assert(sizeof(TextPushConstants)                    == 64zu);
+static_assert(sizeof(Shape2DInstance)                      == 96zu);
+static_assert(sizeof(ShapePushConstants)                   == 64zu);
 // clang-format on
-constexpr auto k_required_push_constant_bytes = std::max(
-    {sizeof(MeshPushConstants), sizeof(DebugPushConstants), sizeof(EnvironmentPushConstants)}
-);
+constexpr auto k_required_push_constant_bytes = std::max({
+    sizeof(MeshPushConstants),
+    sizeof(DebugPushConstants),
+    sizeof(EnvironmentPushConstants),
+    sizeof(TextPushConstants),
+    sizeof(ShapePushConstants),
+});
 
 [[nodiscard]] auto material_base_color_texture_index(const Material& material) noexcept -> u32
 {
@@ -664,6 +693,10 @@ auto DrawList::clear() -> void
     mesh_commands_.clear();
     debug_segments_.clear();
     debug_on_top_segments_.clear();
+    world_text_commands_.clear();
+    screen_text_commands_.clear();
+    world_shapes_.clear();
+    screen_shapes_.clear();
     lights_.clear();
     ambient_light_ = Color{0.035f, 0.040f, 0.050f, 1.0f};
     environment_ = {};
@@ -851,6 +884,170 @@ auto DrawList::set_environment(const EnvironmentConfig& cfg) -> void
     environment_ = cfg;
 }
 
+auto DrawList::text(const TextDrawConfig& cfg) -> void
+{
+    if (cfg.text.empty() or cfg.size_scale <= 0.0f)
+    {
+        return;
+    }
+    world_text_commands_.push_back(
+        TextDrawCommand{
+            .position = cfg.position,
+            .text = std::string{cfg.text},
+            .color = cfg.color,
+            .size_scale = cfg.size_scale,
+        }
+    );
+}
+
+auto DrawList::text_screen(const TextScreenConfig& cfg) -> void
+{
+    if (cfg.text.empty() or cfg.size_scale <= 0.0f)
+    {
+        return;
+    }
+    screen_text_commands_.push_back(
+        TextDrawCommand{
+            .position = cfg.position,
+            .text = std::string{cfg.text},
+            .color = cfg.color,
+            .size_scale = cfg.size_scale,
+        }
+    );
+}
+
+auto DrawList::rect(const RectConfig& cfg) -> void
+{
+    if (cfg.size.x <= 0.0f or cfg.size.y <= 0.0f)
+    {
+        return;
+    }
+    auto& list = cfg.screen_space ? screen_shapes_ : world_shapes_;
+    list.push_back(
+        Shape2DInstance{
+            .bounds = Vec4{cfg.position.x, cfg.position.y, cfg.size.x, cfg.size.y},
+            .fill_color = to_vec4(cfg.fill_color),
+            .stroke_color = to_vec4(cfg.stroke_color),
+            .params0 = Vec4{cfg.corner_radius, cfg.bevel_size, cfg.stroke_width, 0.0f},
+            .params1 = Vec4{0.0f},
+            .shape_type = static_cast<u32>(Shape2DType::box),
+            .flags = 0u,
+        }
+    );
+}
+
+auto DrawList::circle(const CircleConfig& cfg) -> void
+{
+    if (cfg.radius <= 0.0f)
+    {
+        return;
+    }
+    const auto diameter = 2.0f * cfg.radius;
+    auto& list = cfg.screen_space ? screen_shapes_ : world_shapes_;
+    list.push_back(
+        Shape2DInstance{
+            .bounds
+            = Vec4{cfg.center.x - cfg.radius, cfg.center.y - cfg.radius, diameter, diameter},
+            .fill_color = to_vec4(cfg.fill_color),
+            .stroke_color = to_vec4(cfg.stroke_color),
+            .params0 = Vec4{0.0f, 0.0f, cfg.stroke_width, 0.0f},
+            .params1 = Vec4{0.0f},
+            .shape_type = static_cast<u32>(Shape2DType::circle),
+            .flags = 0u,
+        }
+    );
+}
+
+auto DrawList::line_2d(const Line2DConfig& cfg) -> void
+{
+    if (cfg.thickness <= 0.0f)
+    {
+        return;
+    }
+    const auto pad = cfg.thickness * 0.5f + 1.0f;
+    const auto min_x = std::min(cfg.start.x, cfg.end.x) - pad;
+    const auto min_y = std::min(cfg.start.y, cfg.end.y) - pad;
+    const auto max_x = std::max(cfg.start.x, cfg.end.x) + pad;
+    const auto max_y = std::max(cfg.start.y, cfg.end.y) + pad;
+    const auto dashed = (cfg.dash_on > 0.0f and cfg.dash_off > 0.0f);
+    auto& list = cfg.screen_space ? screen_shapes_ : world_shapes_;
+    list.push_back(
+        Shape2DInstance{
+            .bounds = Vec4{min_x, min_y, max_x - min_x, max_y - min_y},
+            .fill_color = to_vec4(cfg.color),
+            .stroke_color = Vec4{0.0f},
+            .params0 = Vec4{cfg.start.x - min_x, cfg.start.y - min_y, cfg.end.x - min_x, cfg.end.y - min_y},
+            .params1 = Vec4{cfg.thickness, cfg.dash_on, cfg.dash_off, cfg.dash_offset},
+            .shape_type = static_cast<u32>(Shape2DType::line),
+            .flags = dashed ? k_shape_flag_dashed : 0u,
+        }
+    );
+}
+
+auto DrawList::sector(const SectorConfig& cfg) -> void
+{
+    if (cfg.outer_radius <= 0.0f)
+    {
+        return;
+    }
+    const auto diameter = 2.0f * cfg.outer_radius;
+    auto& list = cfg.screen_space ? screen_shapes_ : world_shapes_;
+    list.push_back(
+        Shape2DInstance{
+            .bounds = Vec4{
+                cfg.center.x - cfg.outer_radius,
+                cfg.center.y - cfg.outer_radius,
+                diameter,
+                diameter,
+            },
+            .fill_color = to_vec4(cfg.fill_color),
+            .stroke_color = to_vec4(cfg.stroke_color),
+            .params0 = Vec4{cfg.inner_radius, cfg.outer_radius, cfg.start_angle, cfg.end_angle},
+            .params1 = Vec4{cfg.stroke_width, 0.0f, 0.0f, 0.0f},
+            .shape_type = static_cast<u32>(Shape2DType::sector),
+            .flags = 0u,
+        }
+    );
+}
+
+auto DrawList::bezier(const BezierConfig& cfg) -> void
+{
+    if (cfg.thickness <= 0.0f or cfg.segments == 0u)
+    {
+        return;
+    }
+    const auto step = 1.0f / static_cast<f32>(cfg.segments);
+    Vec2 previous = cfg.start;
+    f32 cumulative_arc = 0.0f;
+    for (auto i = 1u; i <= cfg.segments; ++i)
+    {
+        const auto t = static_cast<f32>(i) * step;
+        const auto one_minus_t = 1.0f - t;
+        const Vec2 next{
+            one_minus_t * one_minus_t * cfg.start.x + 2.0f * one_minus_t * t * cfg.control.x
+                + t * t * cfg.end.x,
+            one_minus_t * one_minus_t * cfg.start.y + 2.0f * one_minus_t * t * cfg.control.y
+                + t * t * cfg.end.y,
+        };
+        line_2d(
+            Line2DConfig{
+                .start = previous,
+                .end = next,
+                .color = cfg.color,
+                .thickness = cfg.thickness,
+                .dash_on = cfg.dash_on,
+                .dash_off = cfg.dash_off,
+                .dash_offset = cumulative_arc,
+                .screen_space = cfg.screen_space,
+            }
+        );
+        const auto dx = next.x - previous.x;
+        const auto dy = next.y - previous.y;
+        cumulative_arc += std::sqrt(dx * dx + dy * dy);
+        previous = next;
+    }
+}
+
 auto DrawList::mesh_commands() const noexcept -> std::span<const MeshDrawCommand>
 {
     return std::span<const MeshDrawCommand>{mesh_commands_.data(), mesh_commands_.size()};
@@ -867,6 +1064,32 @@ auto DrawList::debug_on_top_segments() const noexcept -> std::span<const DebugSe
         debug_on_top_segments_.data(),
         debug_on_top_segments_.size(),
     };
+}
+
+auto DrawList::world_text_commands() const noexcept -> std::span<const TextDrawCommand>
+{
+    return std::span<const TextDrawCommand>{
+        world_text_commands_.data(),
+        world_text_commands_.size(),
+    };
+}
+
+auto DrawList::screen_text_commands() const noexcept -> std::span<const TextDrawCommand>
+{
+    return std::span<const TextDrawCommand>{
+        screen_text_commands_.data(),
+        screen_text_commands_.size(),
+    };
+}
+
+auto DrawList::world_shapes() const noexcept -> std::span<const Shape2DInstance>
+{
+    return std::span<const Shape2DInstance>{world_shapes_.data(), world_shapes_.size()};
+}
+
+auto DrawList::screen_shapes() const noexcept -> std::span<const Shape2DInstance>
+{
+    return std::span<const Shape2DInstance>{screen_shapes_.data(), screen_shapes_.size()};
 }
 
 auto DrawList::lights() const noexcept -> std::span<const LightConfig>
@@ -927,6 +1150,21 @@ struct Runtime::Impl
     VkPipelineLayout debug_pipeline_layout{VK_NULL_HANDLE};
     VkPipeline debug_pipeline{VK_NULL_HANDLE};
     VkPipeline debug_on_top_pipeline{VK_NULL_HANDLE};
+    VkDescriptorSetLayout text_descriptor_set_layout{VK_NULL_HANDLE};
+    VkDescriptorPool text_descriptor_pool{VK_NULL_HANDLE};
+    VkDescriptorSet text_descriptor_set{VK_NULL_HANDLE};
+    VkPipelineLayout text_pipeline_layout{VK_NULL_HANDLE};
+    VkPipeline text_pipeline{VK_NULL_HANDLE};
+    TextureResource text_atlas{};
+    BakedFont text_font{};
+    bool text_font_loaded{};
+    std::vector<Buffer> text_instance_buffers{};
+    std::vector<TextInstance> text_instance_scratch{};
+    VkPipelineLayout shape_pipeline_layout{VK_NULL_HANDLE};
+    VkPipeline shape_pipeline{VK_NULL_HANDLE};
+    std::vector<Buffer> shape_instance_buffers{};
+    Vec2 camera_2d_pivot{};
+    f32 camera_2d_zoom{1.0f};
     ShadowMap shadow_map{};
     std::vector<MeshResource> meshes;
     std::deque<RetiredMeshResource> retired_meshes;
@@ -1054,6 +1292,16 @@ struct Runtime::Impl
         bool draw_on_top
     ) -> void;
     auto draw_debug(VkCommandBuffer, VkExtent2D, usize frame_index) -> void;
+    auto draw_text(VkCommandBuffer, VkExtent2D, usize frame_index) -> void;
+    auto load_font(const FontBakeConfig&) -> void;
+    auto destroy_text_resources() noexcept -> void;
+    auto update_text_atlas_descriptor() -> void;
+    auto ensure_text_instance_buffer(usize frame_index, VkDeviceSize size) -> Buffer&;
+    auto draw_shapes(VkCommandBuffer, VkExtent2D, usize frame_index) -> void;
+    auto destroy_shape_resources() noexcept -> void;
+    auto ensure_shape_instance_buffer(usize frame_index, VkDeviceSize size) -> Buffer&;
+    [[nodiscard]] auto current_world_vp(VkExtent2D extent) const noexcept -> Mat4;
+    [[nodiscard]] auto is_2d_mode() const noexcept -> bool;
     auto draw_runtime_ui() -> void;
     auto handle_event(const SDL_Event&) -> void;
     [[nodiscard]] auto framebuffer_mouse_position(f32 window_x, f32 window_y) const -> Vec2;
@@ -2828,6 +3076,10 @@ auto Runtime::Impl::create_pipelines() -> void
         create_shader_module(device, shader_dir / "shadow_quantized_position.vert.spv");
     const auto debug_vert = create_shader_module(device, shader_dir / "debug_line.vert.spv");
     const auto debug_frag = create_shader_module(device, shader_dir / "debug_line.frag.spv");
+    const auto text_vert = create_shader_module(device, shader_dir / "text_2d.vert.spv");
+    const auto text_frag = create_shader_module(device, shader_dir / "text_2d.frag.spv");
+    const auto shape_vert = create_shader_module(device, shader_dir / "shape_2d.vert.spv");
+    const auto shape_frag = create_shader_module(device, shader_dir / "shape_2d.frag.spv");
 
     const auto destroy_shader_modules = [&]() -> void
     {
@@ -2841,6 +3093,10 @@ auto Runtime::Impl::create_pipelines() -> void
         vkDestroyShaderModule(device, shadow_quantized_position_vert, allocation_callbacks);
         vkDestroyShaderModule(device, debug_vert, allocation_callbacks);
         vkDestroyShaderModule(device, debug_frag, allocation_callbacks);
+        vkDestroyShaderModule(device, text_vert, allocation_callbacks);
+        vkDestroyShaderModule(device, text_frag, allocation_callbacks);
+        vkDestroyShaderModule(device, shape_vert, allocation_callbacks);
+        vkDestroyShaderModule(device, shape_frag, allocation_callbacks);
     };
 
     VkPushConstantRange mesh_push_range{};
@@ -3397,11 +3653,267 @@ auto Runtime::Impl::create_pipelines() -> void
         &debug_on_top_pipeline
     ));
 
+    VkDescriptorSetLayoutBinding text_atlas_binding{};
+    text_atlas_binding.binding = 0;
+    text_atlas_binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    text_atlas_binding.descriptorCount = 1;
+    text_atlas_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo text_descriptor_layout_info{};
+    text_descriptor_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    text_descriptor_layout_info.bindingCount = 1;
+    text_descriptor_layout_info.pBindings = &text_atlas_binding;
+    check_vk_result(vkCreateDescriptorSetLayout(
+        device, &text_descriptor_layout_info, allocation_callbacks, &text_descriptor_set_layout
+    ));
+
+    const VkDescriptorPoolSize text_pool_size{
+        .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = 1u,
+    };
+    VkDescriptorPoolCreateInfo text_pool_info{};
+    text_pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    text_pool_info.maxSets = 1;
+    text_pool_info.poolSizeCount = 1;
+    text_pool_info.pPoolSizes = &text_pool_size;
+    check_vk_result(
+        vkCreateDescriptorPool(device, &text_pool_info, allocation_callbacks, &text_descriptor_pool)
+    );
+
+    VkDescriptorSetAllocateInfo text_descriptor_alloc{};
+    text_descriptor_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    text_descriptor_alloc.descriptorPool = text_descriptor_pool;
+    text_descriptor_alloc.descriptorSetCount = 1;
+    text_descriptor_alloc.pSetLayouts = &text_descriptor_set_layout;
+    check_vk_result(vkAllocateDescriptorSets(device, &text_descriptor_alloc, &text_descriptor_set));
+
+    VkPushConstantRange text_push_range{};
+    text_push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    text_push_range.offset = 0;
+    text_push_range.size = sizeof(TextPushConstants);
+    VkPipelineLayoutCreateInfo text_layout_info{};
+    text_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    text_layout_info.setLayoutCount = 1;
+    text_layout_info.pSetLayouts = &text_descriptor_set_layout;
+    text_layout_info.pushConstantRangeCount = 1;
+    text_layout_info.pPushConstantRanges = &text_push_range;
+    check_vk_result(vkCreatePipelineLayout(
+        device, &text_layout_info, allocation_callbacks, &text_pipeline_layout
+    ));
+
+    const VkVertexInputBindingDescription text_binding{
+        .binding = 0,
+        .stride = sizeof(TextInstance),
+        .inputRate = VK_VERTEX_INPUT_RATE_INSTANCE,
+    };
+    const std::array text_attributes{
+        VkVertexInputAttributeDescription{
+            .location = 0,
+            .binding = 0,
+            .format = VK_FORMAT_R32G32_SFLOAT,
+            .offset = offsetof(TextInstance, position),
+        },
+        VkVertexInputAttributeDescription{
+            .location = 1,
+            .binding = 0,
+            .format = VK_FORMAT_R32G32_SFLOAT,
+            .offset = offsetof(TextInstance, size),
+        },
+        VkVertexInputAttributeDescription{
+            .location = 2,
+            .binding = 0,
+            .format = VK_FORMAT_R32G32_SFLOAT,
+            .offset = offsetof(TextInstance, uv_position),
+        },
+        VkVertexInputAttributeDescription{
+            .location = 3,
+            .binding = 0,
+            .format = VK_FORMAT_R32G32_SFLOAT,
+            .offset = offsetof(TextInstance, uv_size),
+        },
+        VkVertexInputAttributeDescription{
+            .location = 4,
+            .binding = 0,
+            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+            .offset = offsetof(TextInstance, color),
+        },
+    };
+    VkPipelineVertexInputStateCreateInfo text_vertex_input{};
+    text_vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    text_vertex_input.vertexBindingDescriptionCount = 1;
+    text_vertex_input.pVertexBindingDescriptions = &text_binding;
+    text_vertex_input.vertexAttributeDescriptionCount = static_cast<u32>(text_attributes.size());
+    text_vertex_input.pVertexAttributeDescriptions = text_attributes.data();
+
+    auto text_depth_state = depth_state;
+    text_depth_state.depthTestEnable = VK_FALSE;
+    text_depth_state.depthWriteEnable = VK_FALSE;
+
+    auto text_color_attachment = color_attachment;
+    text_color_attachment.blendEnable = VK_TRUE;
+    text_color_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    text_color_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    text_color_attachment.colorBlendOp = VK_BLEND_OP_ADD;
+    text_color_attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    text_color_attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    text_color_attachment.alphaBlendOp = VK_BLEND_OP_ADD;
+    auto text_blend_state = blend_state;
+    text_blend_state.pAttachments = &text_color_attachment;
+
+    const std::array text_stages{
+        make_stage(text_vert, VK_SHADER_STAGE_VERTEX_BIT),
+        make_stage(text_frag, VK_SHADER_STAGE_FRAGMENT_BIT),
+    };
+    VkGraphicsPipelineCreateInfo text_pipeline_info = mesh_pipeline_info;
+    text_pipeline_info.stageCount = static_cast<u32>(text_stages.size());
+    text_pipeline_info.pStages = text_stages.data();
+    text_pipeline_info.pVertexInputState = &text_vertex_input;
+    text_pipeline_info.pDepthStencilState = &text_depth_state;
+    text_pipeline_info.pColorBlendState = &text_blend_state;
+    text_pipeline_info.layout = text_pipeline_layout;
+    check_vk_result(vkCreateGraphicsPipelines(
+        device, pipeline_cache, 1, &text_pipeline_info, allocation_callbacks, &text_pipeline
+    ));
+
+    if (text_font_loaded)
+    {
+        update_text_atlas_descriptor();
+    }
+
+    VkPushConstantRange shape_push_range{};
+    shape_push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    shape_push_range.offset = 0;
+    shape_push_range.size = sizeof(ShapePushConstants);
+    VkPipelineLayoutCreateInfo shape_layout_info{};
+    shape_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    shape_layout_info.pushConstantRangeCount = 1;
+    shape_layout_info.pPushConstantRanges = &shape_push_range;
+    check_vk_result(vkCreatePipelineLayout(
+        device, &shape_layout_info, allocation_callbacks, &shape_pipeline_layout
+    ));
+
+    const VkVertexInputBindingDescription shape_binding{
+        .binding = 0,
+        .stride = sizeof(Shape2DInstance),
+        .inputRate = VK_VERTEX_INPUT_RATE_INSTANCE,
+    };
+    const std::array shape_attributes{
+        VkVertexInputAttributeDescription{
+            .location = 0,
+            .binding = 0,
+            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+            .offset = offsetof(Shape2DInstance, bounds),
+        },
+        VkVertexInputAttributeDescription{
+            .location = 1,
+            .binding = 0,
+            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+            .offset = offsetof(Shape2DInstance, fill_color),
+        },
+        VkVertexInputAttributeDescription{
+            .location = 2,
+            .binding = 0,
+            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+            .offset = offsetof(Shape2DInstance, stroke_color),
+        },
+        VkVertexInputAttributeDescription{
+            .location = 3,
+            .binding = 0,
+            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+            .offset = offsetof(Shape2DInstance, params0),
+        },
+        VkVertexInputAttributeDescription{
+            .location = 4,
+            .binding = 0,
+            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+            .offset = offsetof(Shape2DInstance, params1),
+        },
+        VkVertexInputAttributeDescription{
+            .location = 5,
+            .binding = 0,
+            .format = VK_FORMAT_R32_UINT,
+            .offset = offsetof(Shape2DInstance, shape_type),
+        },
+        VkVertexInputAttributeDescription{
+            .location = 6,
+            .binding = 0,
+            .format = VK_FORMAT_R32_UINT,
+            .offset = offsetof(Shape2DInstance, flags),
+        },
+    };
+    VkPipelineVertexInputStateCreateInfo shape_vertex_input{};
+    shape_vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    shape_vertex_input.vertexBindingDescriptionCount = 1;
+    shape_vertex_input.pVertexBindingDescriptions = &shape_binding;
+    shape_vertex_input.vertexAttributeDescriptionCount = static_cast<u32>(shape_attributes.size());
+    shape_vertex_input.pVertexAttributeDescriptions = shape_attributes.data();
+
+    const std::array shape_stages{
+        make_stage(shape_vert, VK_SHADER_STAGE_VERTEX_BIT),
+        make_stage(shape_frag, VK_SHADER_STAGE_FRAGMENT_BIT),
+    };
+
+    auto shape_depth_state = depth_state;
+    shape_depth_state.depthTestEnable = VK_FALSE;
+    shape_depth_state.depthWriteEnable = VK_FALSE;
+
+    auto shape_color_attachment = color_attachment;
+    shape_color_attachment.blendEnable = VK_TRUE;
+    shape_color_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    shape_color_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    shape_color_attachment.colorBlendOp = VK_BLEND_OP_ADD;
+    shape_color_attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    shape_color_attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    shape_color_attachment.alphaBlendOp = VK_BLEND_OP_ADD;
+    auto shape_blend_state = blend_state;
+    shape_blend_state.pAttachments = &shape_color_attachment;
+
+    VkGraphicsPipelineCreateInfo shape_pipeline_info = mesh_pipeline_info;
+    shape_pipeline_info.stageCount = static_cast<u32>(shape_stages.size());
+    shape_pipeline_info.pStages = shape_stages.data();
+    shape_pipeline_info.pVertexInputState = &shape_vertex_input;
+    shape_pipeline_info.pDepthStencilState = &shape_depth_state;
+    shape_pipeline_info.pColorBlendState = &shape_blend_state;
+    shape_pipeline_info.layout = shape_pipeline_layout;
+    check_vk_result(vkCreateGraphicsPipelines(
+        device, pipeline_cache, 1, &shape_pipeline_info, allocation_callbacks, &shape_pipeline
+    ));
+
     destroy_shader_modules();
 }
 
 auto Runtime::Impl::destroy_pipelines() noexcept -> void
 {
+    if (shape_pipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(device, shape_pipeline, allocation_callbacks);
+        shape_pipeline = VK_NULL_HANDLE;
+    }
+    if (shape_pipeline_layout != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineLayout(device, shape_pipeline_layout, allocation_callbacks);
+        shape_pipeline_layout = VK_NULL_HANDLE;
+    }
+    if (text_pipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(device, text_pipeline, allocation_callbacks);
+        text_pipeline = VK_NULL_HANDLE;
+    }
+    if (text_pipeline_layout != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineLayout(device, text_pipeline_layout, allocation_callbacks);
+        text_pipeline_layout = VK_NULL_HANDLE;
+    }
+    text_descriptor_set = VK_NULL_HANDLE;
+    if (text_descriptor_pool != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorPool(device, text_descriptor_pool, allocation_callbacks);
+        text_descriptor_pool = VK_NULL_HANDLE;
+    }
+    if (text_descriptor_set_layout != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorSetLayout(device, text_descriptor_set_layout, allocation_callbacks);
+        text_descriptor_set_layout = VK_NULL_HANDLE;
+    }
     if (debug_on_top_pipeline != VK_NULL_HANDLE)
     {
         vkDestroyPipeline(device, debug_on_top_pipeline, allocation_callbacks);
@@ -3617,12 +4129,13 @@ auto Runtime::Impl::draw_environment(
     const EnvironmentPushConstants push{
         .inverse_view_projection = glm::inverse(camera.view_projection_matrix(aspect)),
         .camera_position = Vec4{camera.position(), 1.0f},
-        .params = Vec4{
-            show_hdri ? environment.background_intensity : 1.0f,
-            environment.rotation_radians,
-            show_hdri ? static_cast<f32>(environment.texture.id) : 0.0f,
-            environment_mode,
-        },
+        .params =
+            Vec4{
+                show_hdri ? environment.background_intensity : 1.0f,
+                environment.rotation_radians,
+                show_hdri ? static_cast<f32>(environment.texture.id) : 0.0f,
+                environment_mode,
+            },
         .background_color = to_vec4(environment.background_color),
         .background_top_color = to_vec4(environment.background_top_color),
     };
@@ -3831,10 +4344,8 @@ auto Runtime::Impl::draw_debug_segments(
     std::memcpy(buffer.mapped, segments.data(), static_cast<usize>(byte_count));
     flush_buffer(buffer, byte_count);
 
-    const auto aspect = static_cast<f32>(std::max(1u, extent.width))
-                        / static_cast<f32>(std::max(1u, extent.height));
     const DebugPushConstants push{
-        .view_projection = camera.view_projection_matrix(aspect),
+        .view_projection = current_world_vp(extent),
         .camera_position = Vec4{camera.position(), 1.0f},
         .camera_right = Vec4{camera.right(), 0.0f},
     };
@@ -3867,6 +4378,336 @@ auto Runtime::Impl::draw_debug(VkCommandBuffer command_buffer, VkExtent2D extent
     );
 }
 
+auto Runtime::Impl::ensure_text_instance_buffer(const usize frame_index, const VkDeviceSize size)
+    -> Buffer&
+{
+    const auto image_count = static_cast<usize>(window_data.ImageCount);
+    if (text_instance_buffers.size() < image_count)
+    {
+        text_instance_buffers.resize(image_count);
+    }
+    auto& buffer = text_instance_buffers.at(frame_index);
+    if (buffer.capacity >= size and buffer.handle != VK_NULL_HANDLE)
+    {
+        return buffer;
+    }
+
+    check_vk_result(vkDeviceWaitIdle(device));
+    destroy_buffer(buffer);
+    buffer = create_buffer(
+        size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, true, VMA_MEMORY_USAGE_AUTO_PREFER_HOST
+    );
+    return buffer;
+}
+
+namespace
+{
+
+auto append_text_instances(
+    std::vector<TextInstance>& out, std::span<const TextDrawCommand> commands, const BakedFont& font
+) -> void
+{
+    if (font.atlas_width == 0u or font.atlas_height == 0u)
+    {
+        return;
+    }
+    const auto inv_atlas_w = 1.0f / static_cast<f32>(font.atlas_width);
+    const auto inv_atlas_h = 1.0f / static_cast<f32>(font.atlas_height);
+
+    for (const auto& cmd : commands)
+    {
+        const auto scale = cmd.size_scale;
+        Vec2 cursor = cmd.position;
+        for (const auto code_unit : cmd.text)
+        {
+            const auto codepoint = static_cast<u32>(static_cast<unsigned char>(code_unit));
+            const auto* glyph = glyph_for(font, codepoint);
+            if (glyph == nullptr)
+            {
+                continue;
+            }
+            if (glyph->atlas_w > 0u and glyph->atlas_h > 0u)
+            {
+                out.push_back(
+                    TextInstance{
+                        .position =
+                            Vec2{
+                                cursor.x + glyph->offset_x * scale,
+                                cursor.y + glyph->offset_y * scale
+                            },
+                        .size =
+                            Vec2{
+                                static_cast<f32>(glyph->atlas_w) * scale,
+                                static_cast<f32>(glyph->atlas_h) * scale
+                            },
+                        .uv_position =
+                            Vec2{
+                                static_cast<f32>(glyph->atlas_x) * inv_atlas_w,
+                                static_cast<f32>(glyph->atlas_y) * inv_atlas_h
+                            },
+                        .uv_size =
+                            Vec2{
+                                static_cast<f32>(glyph->atlas_w) * inv_atlas_w,
+                                static_cast<f32>(glyph->atlas_h) * inv_atlas_h
+                            },
+                        .color = to_vec4(cmd.color),
+                    }
+                );
+            }
+            cursor.x += glyph->advance * scale;
+        }
+    }
+}
+
+[[nodiscard]] auto screen_space_view_projection(VkExtent2D extent) noexcept -> Mat4
+{
+    const auto width = static_cast<f32>(std::max(1u, extent.width));
+    const auto height = static_cast<f32>(std::max(1u, extent.height));
+    return glm::orthoRH_ZO(0.0f, width, 0.0f, height, -1.0f, 1.0f);
+}
+
+[[nodiscard]] auto world_view_projection_2d(VkExtent2D extent, Vec2 pivot, f32 zoom) noexcept
+    -> Mat4
+{
+    const auto width = static_cast<f32>(std::max(1u, extent.width));
+    const auto height = static_cast<f32>(std::max(1u, extent.height));
+    const auto half_w = 0.5f * width * zoom;
+    const auto half_h = 0.5f * height * zoom;
+    return glm::orthoRH_ZO(
+        pivot.x - half_w, pivot.x + half_w, pivot.y - half_h, pivot.y + half_h, -1.0f, 1.0f
+    );
+}
+
+}  // namespace
+
+auto Runtime::Impl::draw_text(
+    const VkCommandBuffer command_buffer, const VkExtent2D extent, const usize frame_index
+) -> void
+{
+    if (text_pipeline == VK_NULL_HANDLE or text_descriptor_set == VK_NULL_HANDLE
+        or !text_font_loaded)
+    {
+        return;
+    }
+
+    text_instance_scratch.clear();
+    append_text_instances(text_instance_scratch, draw_list.world_text_commands(), text_font);
+    const auto world_count = static_cast<u32>(text_instance_scratch.size());
+    append_text_instances(text_instance_scratch, draw_list.screen_text_commands(), text_font);
+    const auto total_count = static_cast<u32>(text_instance_scratch.size());
+    if (total_count == 0u)
+    {
+        return;
+    }
+    const auto screen_count = total_count - world_count;
+
+    const auto byte_count =
+        static_cast<VkDeviceSize>(static_cast<VkDeviceSize>(total_count) * sizeof(TextInstance));
+    auto& buffer = ensure_text_instance_buffer(frame_index, byte_count);
+    std::memcpy(buffer.mapped, text_instance_scratch.data(), static_cast<usize>(byte_count));
+    flush_buffer(buffer, byte_count);
+
+    const std::array vertex_buffers{buffer.handle};
+    const std::array<VkDeviceSize, 1> offsets{0};
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, text_pipeline);
+    vkCmdBindDescriptorSets(
+        command_buffer,
+        VK_PIPELINE_BIND_POINT_GRAPHICS,
+        text_pipeline_layout,
+        0,
+        1,
+        &text_descriptor_set,
+        0,
+        nullptr
+    );
+    vkCmdBindVertexBuffers(command_buffer, 0, 1, vertex_buffers.data(), offsets.data());
+
+    if (world_count > 0u)
+    {
+        const TextPushConstants push{.view_projection = current_world_vp(extent)};
+        vkCmdPushConstants(
+            command_buffer, text_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push
+        );
+        vkCmdDraw(command_buffer, 6u, world_count, 0, 0);
+    }
+
+    if (screen_count > 0u)
+    {
+        const TextPushConstants push{.view_projection = screen_space_view_projection(extent)};
+        vkCmdPushConstants(
+            command_buffer, text_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push
+        );
+        vkCmdDraw(command_buffer, 6u, screen_count, 0, world_count);
+    }
+}
+
+auto Runtime::Impl::update_text_atlas_descriptor() -> void
+{
+    if (text_descriptor_set == VK_NULL_HANDLE or text_atlas.view == VK_NULL_HANDLE
+        or text_atlas.sampler == VK_NULL_HANDLE)
+    {
+        return;
+    }
+    VkDescriptorImageInfo image_info{
+        .sampler = text_atlas.sampler,
+        .imageView = text_atlas.view,
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = text_descriptor_set;
+    write.dstBinding = 0;
+    write.dstArrayElement = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &image_info;
+    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+}
+
+auto Runtime::Impl::load_font(const FontBakeConfig& bake_config) -> void
+{
+    auto baked = bake_font(bake_config);
+
+    check_vk_result(vkDeviceWaitIdle(device));
+    destroy_texture(text_atlas);
+
+    text_atlas = create_texture_resource(
+        baked.pixels.data(), baked.atlas_width, baked.atlas_height, VK_FORMAT_R8_UNORM, 1u
+    );
+    text_font = std::move(baked);
+    text_font_loaded = true;
+    update_text_atlas_descriptor();
+}
+
+auto Runtime::Impl::destroy_text_resources() noexcept -> void
+{
+    for (auto& buffer : text_instance_buffers)
+    {
+        destroy_buffer(buffer);
+    }
+    text_instance_buffers.clear();
+    destroy_texture(text_atlas);
+    text_font = {};
+    text_font_loaded = false;
+}
+
+auto Runtime::Impl::ensure_shape_instance_buffer(const usize frame_index, const VkDeviceSize size)
+    -> Buffer&
+{
+    const auto image_count = static_cast<usize>(window_data.ImageCount);
+    if (shape_instance_buffers.size() < image_count)
+    {
+        shape_instance_buffers.resize(image_count);
+    }
+    auto& buffer = shape_instance_buffers.at(frame_index);
+    if (buffer.capacity >= size and buffer.handle != VK_NULL_HANDLE)
+    {
+        return buffer;
+    }
+
+    check_vk_result(vkDeviceWaitIdle(device));
+    destroy_buffer(buffer);
+    buffer = create_buffer(
+        size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, true, VMA_MEMORY_USAGE_AUTO_PREFER_HOST
+    );
+    return buffer;
+}
+
+auto Runtime::Impl::draw_shapes(
+    const VkCommandBuffer command_buffer, const VkExtent2D extent, const usize frame_index
+) -> void
+{
+    if (shape_pipeline == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    const auto world_shapes = draw_list.world_shapes();
+    const auto screen_shapes = draw_list.screen_shapes();
+    const auto world_count = static_cast<u32>(world_shapes.size());
+    const auto screen_count = static_cast<u32>(screen_shapes.size());
+    if (world_count == 0u and screen_count == 0u)
+    {
+        return;
+    }
+
+    const auto total_count = world_count + screen_count;
+    const auto byte_count = static_cast<VkDeviceSize>(
+        static_cast<VkDeviceSize>(total_count) * sizeof(Shape2DInstance)
+    );
+    auto& buffer = ensure_shape_instance_buffer(frame_index, byte_count);
+    auto* dst = static_cast<std::byte*>(buffer.mapped);
+    if (world_count > 0u)
+    {
+        std::memcpy(dst, world_shapes.data(), world_shapes.size_bytes());
+    }
+    if (screen_count > 0u)
+    {
+        std::memcpy(
+            dst + world_shapes.size_bytes(), screen_shapes.data(), screen_shapes.size_bytes()
+        );
+    }
+    flush_buffer(buffer, byte_count);
+
+    const std::array vertex_buffers{buffer.handle};
+    const std::array<VkDeviceSize, 1> offsets{0};
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, shape_pipeline);
+    vkCmdBindVertexBuffers(command_buffer, 0, 1, vertex_buffers.data(), offsets.data());
+
+    if (world_count > 0u)
+    {
+        const ShapePushConstants push{.view_projection = current_world_vp(extent)};
+        vkCmdPushConstants(
+            command_buffer,
+            shape_pipeline_layout,
+            VK_SHADER_STAGE_VERTEX_BIT,
+            0,
+            sizeof(push),
+            &push
+        );
+        vkCmdDraw(command_buffer, 6u, world_count, 0, 0);
+    }
+
+    if (screen_count > 0u)
+    {
+        const ShapePushConstants push{.view_projection = screen_space_view_projection(extent)};
+        vkCmdPushConstants(
+            command_buffer,
+            shape_pipeline_layout,
+            VK_SHADER_STAGE_VERTEX_BIT,
+            0,
+            sizeof(push),
+            &push
+        );
+        vkCmdDraw(command_buffer, 6u, screen_count, 0, world_count);
+    }
+}
+
+auto Runtime::Impl::destroy_shape_resources() noexcept -> void
+{
+    for (auto& buffer : shape_instance_buffers)
+    {
+        destroy_buffer(buffer);
+    }
+    shape_instance_buffers.clear();
+}
+
+auto Runtime::Impl::is_2d_mode() const noexcept -> bool
+{
+    return config.render_mode == RenderMode::two_d;
+}
+
+auto Runtime::Impl::current_world_vp(const VkExtent2D extent) const noexcept -> Mat4
+{
+    if (is_2d_mode())
+    {
+        return world_view_projection_2d(extent, camera_2d_pivot, camera_2d_zoom);
+    }
+    const auto aspect = static_cast<f32>(std::max(1u, extent.width))
+                        / static_cast<f32>(std::max(1u, extent.height));
+    return camera.view_projection_matrix(aspect);
+}
+
 auto Runtime::Impl::set_main_pass_viewport(
     const VkCommandBuffer command_buffer, const VkExtent2D extent
 ) -> void
@@ -3892,21 +4733,15 @@ auto Runtime::Impl::render_draw_list() -> void
         throw std::runtime_error("render_draw_list requires an active main render pass");
     }
     set_main_pass_viewport(current_frame.command_buffer, current_frame.extent);
-    draw_meshes(
-        current_frame.command_buffer,
-        current_frame.extent,
-        static_cast<usize>(current_frame.swapchain_image_index)
-    );
-    draw_environment(
-        current_frame.command_buffer,
-        current_frame.extent,
-        static_cast<usize>(current_frame.swapchain_image_index)
-    );
-    draw_debug(
-        current_frame.command_buffer,
-        current_frame.extent,
-        static_cast<usize>(current_frame.swapchain_image_index)
-    );
+    const auto image_index = static_cast<usize>(current_frame.swapchain_image_index);
+    if (!is_2d_mode())
+    {
+        draw_meshes(current_frame.command_buffer, current_frame.extent, image_index);
+        draw_environment(current_frame.command_buffer, current_frame.extent, image_index);
+    }
+    draw_debug(current_frame.command_buffer, current_frame.extent, image_index);
+    draw_shapes(current_frame.command_buffer, current_frame.extent, image_index);
+    draw_text(current_frame.command_buffer, current_frame.extent, image_index);
 }
 
 auto Runtime::Impl::draw_runtime_ui() -> void
@@ -4047,7 +4882,14 @@ auto Runtime::Impl::handle_event(const SDL_Event& event) -> void
         input.mouse_px = framebuffer_mouse_position(event.button.x, event.button.y);
         if (event.button.button == SDL_BUTTON_RIGHT)
         {
-            orbiting = true;
+            if (is_2d_mode())
+            {
+                panning = true;
+            }
+            else
+            {
+                orbiting = true;
+            }
         }
         else if (event.button.button == SDL_BUTTON_MIDDLE)
         {
@@ -4061,6 +4903,7 @@ auto Runtime::Impl::handle_event(const SDL_Event& event) -> void
                 .click_count = static_cast<u8>(event.button.clicks),
                 .modifiers = current_modifiers(),
             };
+            input.left_button_down = true;
         }
     }
     if (event.type == SDL_EVENT_MOUSE_BUTTON_UP)
@@ -4068,11 +4911,22 @@ auto Runtime::Impl::handle_event(const SDL_Event& event) -> void
         input.mouse_px = framebuffer_mouse_position(event.button.x, event.button.y);
         if (event.button.button == SDL_BUTTON_RIGHT)
         {
-            orbiting = false;
+            if (is_2d_mode())
+            {
+                panning = false;
+            }
+            else
+            {
+                orbiting = false;
+            }
         }
         else if (event.button.button == SDL_BUTTON_MIDDLE)
         {
             panning = false;
+        }
+        else if (event.button.button == SDL_BUTTON_LEFT)
+        {
+            input.left_button_down = false;
         }
     }
     if (event.type == SDL_EVENT_MOUSE_MOTION and !io.WantCaptureMouse)
@@ -4081,7 +4935,24 @@ auto Runtime::Impl::handle_event(const SDL_Event& event) -> void
         auto framebuffer_width = 1;
         auto framebuffer_height = 1;
         SDL_GetWindowSizeInPixels(window, &framebuffer_width, &framebuffer_height);
-        if (orbiting)
+        auto window_width = 1;
+        auto window_height = 1;
+        SDL_GetWindowSize(window, &window_width, &window_height);
+        const auto fb_scale_x
+            = static_cast<f32>(framebuffer_width) / static_cast<f32>(std::max(1, window_width));
+        const auto fb_scale_y
+            = static_cast<f32>(framebuffer_height) / static_cast<f32>(std::max(1, window_height));
+        if (is_2d_mode())
+        {
+            if (panning)
+            {
+                const auto fb_dx = event.motion.xrel * fb_scale_x;
+                const auto fb_dy = event.motion.yrel * fb_scale_y;
+                camera_2d_pivot.x -= fb_dx * camera_2d_zoom;
+                camera_2d_pivot.y -= fb_dy * camera_2d_zoom;
+            }
+        }
+        else if (orbiting)
         {
             const auto sensitivity = std::clamp(camera.orbit_sensitivity(), 0.10f, 4.0f);
             camera.set_yaw(camera.yaw() - event.motion.xrel * 0.006f * sensitivity);
@@ -4105,9 +4976,30 @@ auto Runtime::Impl::handle_event(const SDL_Event& event) -> void
     }
     if (event.type == SDL_EVENT_MOUSE_WHEEL and !io.WantCaptureMouse)
     {
-        const auto sensitivity = std::clamp(camera.zoom_sensitivity(), 0.10f, 4.0f);
-        const auto distance = camera.distance() * std::exp(-event.wheel.y * 0.12f * sensitivity);
-        camera.set_distance(std::clamp(distance, 0.12f, 200.0f));
+        if (is_2d_mode())
+        {
+            auto framebuffer_width = 1;
+            auto framebuffer_height = 1;
+            SDL_GetWindowSizeInPixels(window, &framebuffer_width, &framebuffer_height);
+            const auto cursor_px = input.mouse_px;
+            const Vec2 center_px{
+                0.5f * static_cast<f32>(std::max(1, framebuffer_width)),
+                0.5f * static_cast<f32>(std::max(1, framebuffer_height)),
+            };
+            const auto zoom_factor = std::exp(-event.wheel.y * 0.12f);
+            const auto new_zoom = std::clamp(camera_2d_zoom * zoom_factor, 0.001f, 1000.0f);
+            const auto delta_zoom = camera_2d_zoom - new_zoom;
+            camera_2d_pivot.x += (cursor_px.x - center_px.x) * delta_zoom;
+            camera_2d_pivot.y += (cursor_px.y - center_px.y) * delta_zoom;
+            camera_2d_zoom = new_zoom;
+        }
+        else
+        {
+            const auto sensitivity = std::clamp(camera.zoom_sensitivity(), 0.10f, 4.0f);
+            const auto distance
+                = camera.distance() * std::exp(-event.wheel.y * 0.12f * sensitivity);
+            camera.set_distance(std::clamp(distance, 0.12f, 200.0f));
+        }
     }
 }
 
@@ -4154,6 +5046,11 @@ auto Runtime::Impl::reset_input_frame() -> void
     input.key_enter_pressed = false;
     input.mouse_px = framebuffer_mouse_position(mouse_x, mouse_y);
     input.mouse_captured_by_ui = ImGui::GetIO().WantCaptureMouse;
+    const auto mods = current_modifiers();
+    input.shift_held = mods.shift;
+    input.control_held = mods.control;
+    input.alt_held = mods.alt;
+    input.super_held = mods.super;
 }
 
 auto Runtime::Impl::rebuild_swapchain_if_needed() -> void
@@ -4480,6 +5377,8 @@ auto Runtime::Impl::shutdown() noexcept -> void
     }
     meshes.clear();
 
+    destroy_text_resources();
+    destroy_shape_resources();
     destroy_pipelines();
     destroy_shadow_map();
 
@@ -4694,6 +5593,10 @@ auto Runtime::Impl::render_shadow_pass() -> void
         frame_ui_end_cpu = frame_update_end_cpu;
     }
     render_begin_cpu = std::chrono::steady_clock::now();
+    if (is_2d_mode())
+    {
+        return;
+    }
     draw_shadow_map(current_frame.command_buffer);
 }
 
@@ -5029,6 +5932,21 @@ auto Runtime::imgui_texture_id(TextureHandle handle) -> uptr
     return impl_->imgui_texture_id(handle);
 }
 
+auto Runtime::load_font(const FontBakeConfig& config) -> void
+{
+    impl_->load_font(config);
+}
+
+auto Runtime::font() const noexcept -> const BakedFont&
+{
+    return impl_->text_font;
+}
+
+auto Runtime::font_loaded() const noexcept -> bool
+{
+    return impl_->text_font_loaded;
+}
+
 auto Runtime::request_screenshot(std::filesystem::path path, const bool transparent) -> void
 {
     impl_->pending_screenshot = std::move(path);
@@ -5048,6 +5966,48 @@ auto Runtime::camera() noexcept -> Camera&
 auto Runtime::camera() const noexcept -> const Camera&
 {
     return impl_->camera;
+}
+
+auto Runtime::render_mode() const noexcept -> RenderMode
+{
+    return impl_->config.render_mode;
+}
+
+auto Runtime::camera_2d_pivot() const noexcept -> Vec2
+{
+    return impl_->camera_2d_pivot;
+}
+
+auto Runtime::camera_2d_zoom() const noexcept -> f32
+{
+    return impl_->camera_2d_zoom;
+}
+
+auto Runtime::set_camera_2d(Vec2 pivot, f32 zoom) noexcept -> void
+{
+    impl_->camera_2d_pivot = pivot;
+    impl_->camera_2d_zoom = std::max(0.001f, zoom);
+}
+
+auto Runtime::framebuffer_extent() const noexcept -> Vec2
+{
+    auto width = 1;
+    auto height = 1;
+    if (impl_->window != nullptr)
+    {
+        SDL_GetWindowSizeInPixels(impl_->window, &width, &height);
+    }
+    return Vec2{static_cast<f32>(width), static_cast<f32>(height)};
+}
+
+auto Runtime::screen_to_world_2d(Vec2 pixel) const noexcept -> Vec2
+{
+    const auto extent = framebuffer_extent();
+    const Vec2 center{0.5f * extent.x, 0.5f * extent.y};
+    return Vec2{
+        impl_->camera_2d_pivot.x + (pixel.x - center.x) * impl_->camera_2d_zoom,
+        impl_->camera_2d_pivot.y + (pixel.y - center.y) * impl_->camera_2d_zoom,
+    };
 }
 
 auto Runtime::stats() const noexcept -> const RuntimeStats&

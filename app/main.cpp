@@ -6,6 +6,7 @@
 
 #include <cstdlib>
 #include <exception>
+#include <format>
 #include <glm/gtc/quaternion.hpp>
 #include <iostream>
 #include <string_view>
@@ -26,6 +27,13 @@ class BasicApp
             .yaw = glm::radians(42.0f),
             .pitch = glm::radians(26.0f),
         });
+
+#if defined(DANS_VK_DEFAULT_FONT_PATH)
+        runtime.load_font({
+            .ttf_path = DANS_VK_DEFAULT_FONT_PATH,
+            .pixel_size = 28.0f,
+        });
+#endif
     }
 
     auto update(dans::vk::FrameContext& frame, dans::vk::f32 dt_seconds) -> void
@@ -74,6 +82,26 @@ class BasicApp
         frame.draw.debug_arrow({.origin = {}, .vector = dans::vk::k_axis_x, .color = dans::vk::Color::red});
         frame.draw.debug_arrow({.origin = {}, .vector = dans::vk::k_axis_y, .color = dans::vk::Color::green});
         frame.draw.debug_arrow({.origin = {}, .vector = dans::vk::k_axis_z, .color = dans::vk::Color::blue});
+
+        frame.draw.text_screen({
+            .position = {24.0f, 48.0f},
+            .text = "dans_vk text demo",
+            .color = dans::vk::Color::white,
+        });
+        const auto seconds_line
+            = std::format("t = {:.2f}s", static_cast<dans::vk::f64>(elapsed_seconds_));
+        frame.draw.text_screen({
+            .position = {24.0f, 84.0f},
+            .text = seconds_line,
+            .color = dans::vk::Color{0.78f, 0.86f, 0.98f, 1.0f},
+            .size_scale = 0.85f,
+        });
+        frame.draw.text_screen({
+            .position = {24.0f, 116.0f},
+            .text = "axes: X red, Y green, Z blue",
+            .color = dans::vk::Color{0.78f, 0.86f, 0.98f, 1.0f},
+            .size_scale = 0.85f,
+        });
     }
 
   private:

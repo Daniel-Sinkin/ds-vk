@@ -2,7 +2,10 @@
 
 #include "dans/vk/camera.hpp"
 #include "dans/vk/debug_draw.hpp"
+#include "dans/vk/font_atlas.hpp"
 #include "dans/vk/mesh.hpp"
+#include "dans/vk/shape_draw.hpp"
+#include "dans/vk/text_draw.hpp"
 #include "dans/vk/types.hpp"
 
 #include <concepts>
@@ -192,6 +195,13 @@ class DrawList
     auto debug_line       (const DebugLineConfig&       ) -> void;
     auto debug_arrow      (const DebugArrowConfig&      ) -> void;
     auto debug_sphere     (const DebugSphereConfig&     ) -> void;
+    auto text             (const TextDrawConfig&        ) -> void;
+    auto text_screen      (const TextScreenConfig&      ) -> void;
+    auto rect             (const RectConfig&            ) -> void;
+    auto circle           (const CircleConfig&          ) -> void;
+    auto line_2d          (const Line2DConfig&          ) -> void;
+    auto sector           (const SectorConfig&          ) -> void;
+    auto bezier           (const BezierConfig&          ) -> void;
     auto add_light        (const LightConfig&           ) -> void;
     auto directional_light(const DirectionalLightConfig&) -> void;
     auto radial_light     (const RadialLightConfig&     ) -> void;
@@ -201,6 +211,10 @@ class DrawList
     [[nodiscard]] auto mesh_commands()         const noexcept -> std::span<const MeshDrawCommand>;
     [[nodiscard]] auto debug_segments()        const noexcept -> std::span<const DebugSegment>;
     [[nodiscard]] auto debug_on_top_segments() const noexcept -> std::span<const DebugSegment>;
+    [[nodiscard]] auto world_text_commands()   const noexcept -> std::span<const TextDrawCommand>;
+    [[nodiscard]] auto screen_text_commands()  const noexcept -> std::span<const TextDrawCommand>;
+    [[nodiscard]] auto world_shapes()          const noexcept -> std::span<const Shape2DInstance>;
+    [[nodiscard]] auto screen_shapes()         const noexcept -> std::span<const Shape2DInstance>;
     [[nodiscard]] auto lights()                const noexcept -> std::span<const LightConfig>;
     [[nodiscard]] auto ambient_light()         const noexcept -> Color;
     [[nodiscard]] auto environment()           const noexcept -> const EnvironmentConfig&;
@@ -210,6 +224,10 @@ class DrawList
     std::vector<MeshDrawCommand> mesh_commands_{};
     std::vector<DebugSegment> debug_segments_{};
     std::vector<DebugSegment> debug_on_top_segments_{};
+    std::vector<TextDrawCommand> world_text_commands_{};
+    std::vector<TextDrawCommand> screen_text_commands_{};
+    std::vector<Shape2DInstance> world_shapes_{};
+    std::vector<Shape2DInstance> screen_shapes_{};
     std::vector<LightConfig> lights_{};
     Color ambient_light_{0.035f, 0.040f, 0.050f, 1.0f};
     EnvironmentConfig environment_{};
@@ -227,6 +245,12 @@ struct RuntimeStats
     u32 lights{};
 };
 
+enum class RenderMode : u8
+{
+    three_d = 0,
+    two_d = 1,
+};
+
 struct RuntimeConfig
 {
     std::string window_title{"dans_vk app"};
@@ -240,6 +264,7 @@ struct RuntimeConfig
     bool enable_validation{true};
     Color clear_color{0.035f, 0.045f, 0.055f, 1.0f};
     u32 shadow_map_resolution{2048};
+    RenderMode render_mode{RenderMode::three_d};
 };
 
 struct TextureLoadConfig
@@ -294,6 +319,11 @@ struct InputState
     bool key_z_pressed{};
     bool key_c_pressed{};
     bool key_enter_pressed{};
+    bool left_button_down{};
+    bool shift_held{};
+    bool control_held{};
+    bool alt_held{};
+    bool super_held{};
     MouseClick left_click{};
 };
 
@@ -393,11 +423,21 @@ class Runtime
     [[nodiscard]] auto load_hdr_texture(const std::filesystem::path&, const HdrTextureLoadConfig& = {}) -> TextureHandle;
     [[nodiscard]] auto upload_texture_rgba(std::span<const ColorU8>, u32 width, u32 height, const TextureLoadConfig& = {}) -> TextureHandle;
     [[nodiscard]] auto imgui_texture_id(TextureHandle) -> uptr;
+    auto load_font(const FontBakeConfig&) -> void;
+    [[nodiscard]] auto font() const noexcept -> const BakedFont&;
+    [[nodiscard]] auto font_loaded() const noexcept -> bool;
     auto request_screenshot(std::filesystem::path path, bool transparent = false) -> void;
 
     auto camera(const CameraConfig&)                       noexcept -> Camera&;
     [[nodiscard]] auto camera()                            noexcept -> Camera&;
     [[nodiscard]] auto camera()                      const noexcept -> const Camera&;
+
+    [[nodiscard]] auto render_mode()                 const noexcept -> RenderMode;
+    [[nodiscard]] auto camera_2d_pivot()             const noexcept -> Vec2;
+    [[nodiscard]] auto camera_2d_zoom()              const noexcept -> f32;
+    auto set_camera_2d(Vec2 pivot, f32 zoom)               noexcept -> void;
+    [[nodiscard]] auto screen_to_world_2d(Vec2 pixel) const noexcept -> Vec2;
+    [[nodiscard]] auto framebuffer_extent()          const noexcept -> Vec2;
     [[nodiscard]] auto stats()                       const noexcept -> const RuntimeStats&;
     [[nodiscard]] auto descriptor_indexing_support() const noexcept -> const DescriptorIndexingSupport&;
     // clang-format on

@@ -151,6 +151,10 @@ if(DANS_VK_BUILD_RUNTIME AND Vulkan_FOUND)
     dans/vk/shaders/shadow_quantized_position.vert
     dans/vk/shaders/debug_line.vert
     dans/vk/shaders/debug_line.frag
+    dans/vk/shaders/text_2d.vert
+    dans/vk/shaders/text_2d.frag
+    dans/vk/shaders/shape_2d.vert
+    dans/vk/shaders/shape_2d.frag
   )
   set(DANS_VK_SHADER_OUTPUTS)
   foreach(DANS_VK_SHADER ${DANS_VK_SHADER_SOURCES})
@@ -197,15 +201,18 @@ if(DANS_VK_BUILD_RUNTIME AND Vulkan_FOUND)
 
   add_library(dans_vk STATIC
     dans/vk/assets_write.cpp
+    dans/vk/font_atlas.cpp
     dans/vk/runtime.cpp
     dans/vk/stb_image_impl.cpp
     dans/vk/stb_image_write_impl.cpp
+    dans/vk/stb_truetype_impl.cpp
   )
   add_library(dans::vk ALIAS dans_vk)
   add_library(dans::vk::runtime ALIAS dans_vk)
   set_source_files_properties(
     dans/vk/stb_image_impl.cpp
     dans/vk/stb_image_write_impl.cpp
+    dans/vk/stb_truetype_impl.cpp
     PROPERTIES SKIP_PRECOMPILE_HEADERS ON
   )
   add_dependencies(dans_vk dans_vk_shaders)
@@ -232,7 +239,17 @@ if(DANS_VK_BUILD_RUNTIME AND Vulkan_FOUND)
   if(DANS_VK_BUILD_EXAMPLES)
     add_executable(dans_vk_basic_app app/main.cpp)
     target_link_libraries(dans_vk_basic_app PRIVATE dans_vk dans_vk_viz dans_vk_warnings)
+    target_compile_definitions(dans_vk_basic_app PRIVATE
+      DANS_VK_DEFAULT_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/external/fonts/Inter-Regular.ttf"
+    )
     dans_vk_enable_pch(dans_vk_basic_app)
+
+    add_executable(dans_vk_2d_app app/main_2d.cpp)
+    target_link_libraries(dans_vk_2d_app PRIVATE dans_vk dans_vk_warnings)
+    target_compile_definitions(dans_vk_2d_app PRIVATE
+      DANS_VK_DEFAULT_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/external/fonts/Inter-Regular.ttf"
+    )
+    dans_vk_enable_pch(dans_vk_2d_app)
   endif()
 
   if(DANS_VK_BUILD_TESTS)
